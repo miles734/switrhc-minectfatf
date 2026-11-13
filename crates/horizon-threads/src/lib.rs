@@ -23,6 +23,19 @@ pub fn favour_current() -> bool {
     favour()
 }
 
+/// Set the calling thread ahead of the render and server threads on the Switch, while keeping it
+/// on the console's audio core when available.
+pub fn audio_current() -> bool {
+    #[cfg(target_os = "horizon")]
+    {
+        switch::audio()
+    }
+    #[cfg(not(target_os = "horizon"))]
+    {
+        favour_current()
+    }
+}
+
 /// The Nintendo Switch (Horizon). Its kernel runs the highest-priority ready thread on each core
 /// and moves a thread only when its own core mask says so: a helper on the server's core at the
 /// same priority holds a tick back until it blocks. Lower numbers are higher priorities; threads
@@ -37,6 +50,11 @@ mod switch {
     const CURRENT_THREAD: u32 = 0xFFFF_8000;
     /// The render thread is the main thread, on core 0; the server takes core 1.
     const SERVER_CORE: i32 = 1;
+    /// The audio thread goes on core 2 to stay above the render and server loops.
+    pub const AUDIO_CORE: i32 = 2;
+    /// A slightly stronger priority than the server thread's; libnx's regular thread priority is
+    /// enumerated around 0x2B for the process's higher-priority work.
+    pub const AUDIO_PRIORITY: u32 = 0x2B;
 
     /// Ahead of the default priority, on a core of its own.
     pub fn favour() -> bool {
@@ -46,6 +64,14 @@ mod switch {
         unsafe {
             (main || svcSetThreadCoreMask(CURRENT_THREAD, SERVER_CORE, 1 << SERVER_CORE) == 0)
                 && svcSetThreadPriority(CURRENT_THREAD, 0x2B) == 0
+        }
+    }
+    /// The audio thread gets the same priority as the inner server loop, but on core 2 so it does
+    /// not wait behind the render and server threads as they push a frame or tick.
+    pub fn audio() -> bool {
+        unsafe {
+            svcSetThreadCoreMask(CURRENT_THREAD, AUDIO_CORE, 1 << AUDIO_CORE) == 0
+                && svcSetThreadPriority(CURRENT_THREAD, AUDIO_PRIORITY) == 0
         }
     }
     /// Behind the server and render threads: runs when they wait.

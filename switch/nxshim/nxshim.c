@@ -5,6 +5,149 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+// The audout service is deprecated in newer libnx releases, but it still works on the Switch and
+// is the only path the game's existing mixer can drive without adding a new library.
+typedef struct {
+    void *buffer;
+    size_t buffer_size;
+    size_t data_size;
+    size_t data_offset;
+    void *next;
+} NxAudioOutBuffer;
+
+typedef struct {
+    NxAudioOutBuffer *buffers;
+    size_t count;
+    size_t frames_per_buffer;
+    size_t bytes_per_buffer;
+    size_t *free;
+    size_t free_count;
+    int live;
+} NxAudioState;
+
+static NxAudioState g_nx_audio = {0};
+
+static size_t nxshim_audio_aligned_size(size_t bytes) {
+    return (bytes + 0xFFFu) & ~(size_t)0xFFFu;
+}
+
+int nxshim_audio_init(uint32_t *rate, uint32_t *channels) {
+    if (!rate || !channels) return -1;
+    if (R_FAILED(audoutInitialize())) return -1;
+    if (R_FAILED(audoutStartAudioOut())) {
+        audoutExit();
+        return -1;
+    }
+    *rate = audoutGetSampleRate();
+    *channels = audoutGetChannelCount();
+    if (audoutGetPcmFormat() != PcmFormat_Int16) {
+        audoutStopAudioOut();
+        audoutExit();
+        return -1;
+    }
+    return 0;
+}
+
+int nxshim_audio_open_buffers(size_t frames_per_buffer, size_t count) {
+    if (frames_per_buffer == 0 || count == 0) return -1;
+    if (g_nx_audio.live) return 0;
+
+    size_t bytes_per_buffer = frames_per_buffer * sizeof(int16_t) * 2;
+    size_t aligned_total = nxshim_audio_aligned_size(bytes_per_buffer);
+    g_nx_audio.buffers = calloc(count, sizeof(NxAudioOutBuffer));
+    g_nx_audio.free = calloc(count, sizeof(size_t));
+    if (!g_nx_audio.buffers || !g_nx_audio.free) {
+        free(g_nx_audio.buffers);
+        free(g_nx_audio.free);
+        g_nx_audio.buffers = NULL;
+        g_nx_audio.free = NULL;
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        g_nx_audio.buffers[i].buffer = aligned_alloc(0x1000, aligned_total);
+        if (!g_nx_audio.buffers[i].buffer) {
+            for (size_t j = 0; j < i; j++) free(g_nx_audio.buffers[j].buffer);
+            free(g_nx_audio.buffers);
+            free(g_nx_audio.free);
+            g_nx_audio.buffers = NULL;
+            g_nx_audio.free = NULL;
+            return -1;
+        }
+        memset(g_nx_audio.buffers[i].buffer, 0, aligned_total);
+        g_nx_audio.buffers[i].buffer_size = aligned_total;
+        g_nx_audio.buffers[i].data_size = 0;
+        g_nx_audio.buffers[i].data_offset = 0;
+        g_nx_audio.buffers[i].next = NULL;
+        g_nx_audio.free[g_nx_audio.free_count++] = i;
+    }
+
+    g_nx_audio.count = count;
+    g_nx_audio.frames_per_buffer = frames_per_buffer;
+    g_nx_audio.bytes_per_buffer = bytes_per_buffer;
+    g_nx_audio.live = 1;
+    for (size_t i = 0; i < g_nx_audio.count; i++) {
+        g_nx_audio.buffers[i].data_size = bytes_per_buffer;
+        g_nx_audio.buffers[i].data_offset = 0;
+        g_nx_audio.buffers[i].next = NULL;
+        audoutAppendAudioOutBuffer(&g_nx_audio.buffers[i]);
+    }
+    return 0;
+}
+
+int16_t *nxshim_audio_acquire(void) {
+    if (!g_nx_audio.live || !g_nx_audio.free || g_nx_audio.free_count == 0) {
+        u32 released = 0;
+        u32 count = 0;
+        audoutWaitPlayFinish(&released, &count, 20 * 1000 * 1000ULL);
+        if (g_nx_audio.free_count == 0 && g_nx_audio.live && g_nx_audio.buffers) {
+            for (size_t i = 0; i < g_nx_audio.count; i++) {
+                g_nx_audio.free[g_nx_audio.free_count++] = i;
+            }
+        }
+    }
+    if (!g_nx_audio.live || !g_nx_audio.free || g_nx_audio.free_count == 0) {
+        return NULL;
+    }
+    size_t idx = g_nx_audio.free[--g_nx_audio.free_count];
+    return g_nx_audio.buffers[idx].buffer;
+}
+
+int nxshim_audio_submit(int16_t *data, size_t bytes) {
+    if (!g_nx_audio.live || !g_nx_audio.buffers || !data) return -1;
+    for (size_t i = 0; i < g_nx_audio.count; i++) {
+        if (g_nx_audio.buffers[i].buffer == data) {
+            g_nx_audio.buffers[i].data_size = bytes;
+            g_nx_audio.buffers[i].data_offset = 0;
+            g_nx_audio.buffers[i].next = NULL;
+            return R_SUCCEEDED(audoutAppendAudioOutBuffer(&g_nx_audio.buffers[i])) ? 0 : -1;
+        }
+    }
+    return -1;
+}
+
+void nxshim_audio_close(void) {
+    if (!g_nx_audio.live) return;
+    audoutStopAudioOut();
+    audoutExit();
+    if (g_nx_audio.buffers) {
+        for (size_t i = 0; i < g_nx_audio.count; i++) {
+            if (g_nx_audio.buffers[i].buffer) free(g_nx_audio.buffers[i].buffer);
+        }
+        free(g_nx_audio.buffers);
+        g_nx_audio.buffers = NULL;
+    }
+    free(g_nx_audio.free);
+    g_nx_audio.free = NULL;
+    g_nx_audio.count = 0;
+    g_nx_audio.frames_per_buffer = 0;
+    g_nx_audio.bytes_per_buffer = 0;
+    g_nx_audio.free_count = 0;
+    g_nx_audio.live = 0;
+}
 
 ssize_t getrandom(void *buf, size_t len, unsigned int flags) {
     (void)flags;

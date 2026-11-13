@@ -1,0 +1,2 @@
+﻿origin	https://github.com/MakrSas/horizon-switch.git (fetch)
+origin	https://github.com/MakrSas/horizon-switch.git (push)

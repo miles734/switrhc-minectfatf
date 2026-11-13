@@ -16,7 +16,10 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// An OpenAL source's state.
@@ -136,11 +139,27 @@ fn attach(mixer: &Mutex<Mixer>, channel: ChannelId, samples: Samples, looping: b
         c.looping |= looping;
     }
 }
-/// The open output stream. A build without the `audio` feature (the server build, which must not
-/// need libasound) never has one.
-#[cfg(feature = "audio")]
+/// The open output stream. A Switch build uses the native audout ring buffered output, while the
+/// desktop builds keep the existing cpal stream and the server build stays silent.
+#[cfg(target_os = "horizon")]
+struct Stream {
+    thread: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "horizon")]
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "horizon"), feature = "audio"))]
 type Stream = cpal::Stream;
-#[cfg(not(feature = "audio"))]
+#[cfg(all(not(target_os = "horizon"), not(feature = "audio")))]
 type Stream = std::convert::Infallible;
 pub struct Audio {
     _stream: Option<Stream>,
@@ -373,8 +392,26 @@ fn distance_gain(linear: Option<f32>, distance: f32) -> f32 {
         Some(_) => 0.0,
     }
 }
-// Only the output stream mixes; a build without one (no `audio` feature) never does.
-#[cfg_attr(not(feature = "audio"), allow(dead_code))]
+
+/// Convert the mixer result to 16-bit PCM without sending NaNs or overrunning the range.
+fn f32_to_i16(sample: f32) -> i16 {
+    let sample = if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let scaled = sample * 32768.0f32;
+    if scaled >= 32767.5 {
+        i16::MAX
+    } else if scaled <= -32768.5 {
+        i16::MIN
+    } else {
+        scaled.round() as i16
+    }
+}
+// Only the output stream mixes; a build without one (no `audio` feature, or the Switch backend)
+// still needs the mixer to compile and to remain testable.
+#[cfg_attr(not(any(feature = "audio", target_os = "horizon")), allow(dead_code))]
 fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
     data.fill(0.0);
     let listener = mixer.listener;
@@ -479,7 +516,7 @@ fn mix(mixer: &mut Mixer, data: &mut [f32], channels: usize, rate: u32) {
 /// `HORIZON_NO_AUDIO`, or a virtual screen (`vscreen`), where agents and
 /// harnesses run the game and must stay off the user's speakers.
 /// `HORIZON_AUDIO=1` opens the output anyway (testing into a null sink).
-#[cfg(any(feature = "audio", test))]
+#[cfg(any(feature = "audio", target_os = "horizon", test))]
 fn output_disabled(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
     if var("HORIZON_NO_AUDIO").is_some() {
         return Some("audio off: HORIZON_NO_AUDIO is set".into());
@@ -601,11 +638,66 @@ impl Audio {
             stopped: Default::default(),
         }
     }
-    #[cfg(not(feature = "audio"))]
+    #[cfg(not(any(feature = "audio", target_os = "horizon")))]
     fn open(_: Arc<Mutex<Mixer>>) -> Result<Stream> {
         Err("this build has no sound output (built without the `audio` feature)".into())
     }
-    #[cfg(feature = "audio")]
+
+    #[cfg(target_os = "horizon")]
+    fn open(mixer: Arc<Mutex<Mixer>>) -> Result<Stream> {
+        if let Some(reason) = output_disabled(|name| std::env::var_os(name)) {
+            return Err(reason.into());
+        }
+
+        let output = horizon_nx::audio::Output::open().map_err(|e| format!("{e}"))?;
+        let rate = output.rate();
+        let channels = output.channels();
+        let frames = output.frames_per_buffer();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("Audio thread".into())
+            .spawn(move || {
+                let mut scratch = vec![0.0f32; frames * channels];
+                let mut stream = output;
+                // Keep the audio thread ahead of the render/server loops on Switch: it owns its own
+                // core and priority, but the global OS call is still the safest place to keep it.
+                let _ = horizon_threads::audio_current();
+                while !stop_thread.load(Ordering::Relaxed) {
+                    let ok = stream.play(|buf| {
+                        if let Ok(mut mixer) = mixer.lock() {
+                            scratch.resize(buf.len(), 0.0);
+                            mix(&mut mixer, &mut scratch, channels, rate);
+                            for (dst, sample) in buf.iter_mut().zip(scratch.iter()) {
+                                *dst = f32_to_i16(*sample);
+                            }
+                        } else {
+                            buf.fill(0);
+                        }
+                    });
+                    if !ok {
+                        std::thread::yield_now();
+                        if stop_thread.load(Ordering::Relaxed) {
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("audio thread init failed: {e}"))?;
+
+        log::info!(
+            "Horizon: audio output ready, {} Hz, {} channels, {} frames per buffer",
+            rate,
+            channels,
+            frames
+        );
+        Ok(Stream {
+            thread: Some(thread),
+            stop,
+        })
+    }
+
+    #[cfg(all(not(target_os = "horizon"), feature = "audio"))]
     fn open(mixer: Arc<Mutex<Mixer>>) -> Result<Stream> {
         if let Some(reason) = output_disabled(|name| std::env::var_os(name)) {
             return Err(reason.into());
@@ -973,6 +1065,20 @@ mod tests {
         assert_eq!(distance_gain(Some(16.0), 8.0), 0.5);
         assert_eq!(distance_gain(Some(16.0), 16.0), 0.0);
         assert_eq!(distance_gain(Some(16.0), 40.0), 0.0);
+    }
+
+    #[test]
+    fn f32_pcm_conversion_clamps_nan_and_full_scale() {
+        assert_eq!(f32_to_i16(0.0), 0);
+        assert_eq!(f32_to_i16(1.0), i16::MAX);
+        assert_eq!(f32_to_i16(-1.0), i16::MIN);
+        assert_eq!(f32_to_i16(1.5), i16::MAX);
+        assert_eq!(f32_to_i16(-1.5), i16::MIN);
+        assert_eq!(f32_to_i16(0.5), 16384);
+        assert_eq!(f32_to_i16(-0.5), -16384);
+        assert_eq!(f32_to_i16(f32::NAN), 0);
+        assert_eq!(f32_to_i16(f32::INFINITY), i16::MAX);
+        assert_eq!(f32_to_i16(f32::NEG_INFINITY), i16::MIN);
     }
 
     #[test]
